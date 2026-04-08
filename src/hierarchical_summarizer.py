@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import warnings
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import torch
 from transformers import (
@@ -15,6 +16,11 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
 )
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
 
 
 PT_STOPWORDS = {
@@ -71,6 +77,10 @@ PT_STOPWORDS = {
 }
 
 
+def _safe_div(num: float, den: float, default: float = 0.0) -> float:
+    return num / den if den else default
+
+
 @dataclass
 class SummarizationConfig:
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -94,6 +104,11 @@ class SummarizationConfig:
     top_p: float = 1.0
     repetition_penalty: float = 1.05
     language: str = "pt-BR"
+    semantic_reinsertion_enabled: bool = True
+    semantic_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    semantic_similarity_threshold: float = 0.56
+    semantic_batch_size: int = 32
+    factual_eval_top_sentences: int = 24
 
     def validate(self) -> None:
         if not 0 < self.target_reduction_ratio < 1:
@@ -106,6 +121,12 @@ class SummarizationConfig:
             raise ValueError("merge_group_size must be >= 2.")
         if self.max_levels < 1:
             raise ValueError("max_levels must be >= 1.")
+        if not 0.1 <= self.semantic_similarity_threshold <= 0.95:
+            raise ValueError("semantic_similarity_threshold must be between 0.1 and 0.95.")
+        if self.semantic_batch_size < 1:
+            raise ValueError("semantic_batch_size must be >= 1.")
+        if self.factual_eval_top_sentences < 1:
+            raise ValueError("factual_eval_top_sentences must be >= 1.")
 
 
 class HierarchicalSummarizer:
@@ -134,6 +155,11 @@ class HierarchicalSummarizer:
             self.model = AutoModelForCausalLM.from_pretrained(self.config.model_name, **model_kwargs)
             self.is_encoder_decoder = False
         self.model.eval()
+        self.generation_device = self._resolve_generation_device()
+
+        self.semantic_model = None
+        if self.config.semantic_reinsertion_enabled:
+            self._load_semantic_model()
 
     @staticmethod
     def _resolve_dtype(dtype_name: str):
@@ -147,6 +173,48 @@ class HierarchicalSummarizer:
         if dtype_name == "float32":
             return torch.float32
         raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+    @staticmethod
+    def _best_compute_device() -> str:
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def _resolve_generation_device(self) -> torch.device:
+        device_map = getattr(self.model, "hf_device_map", None)
+        if isinstance(device_map, dict):
+            for mapped_device in device_map.values():
+                if isinstance(mapped_device, str):
+                    if mapped_device.startswith("cuda"):
+                        return torch.device(mapped_device)
+                    if mapped_device == "mps":
+                        return torch.device("mps")
+                    if mapped_device == "cpu":
+                        return torch.device("cpu")
+        model_device = getattr(self.model, "device", None)
+        if isinstance(model_device, torch.device) and model_device.type != "meta":
+            return model_device
+        return torch.device(self._best_compute_device())
+
+    def _load_semantic_model(self) -> None:
+        if SentenceTransformer is None:
+            warnings.warn(
+                "sentence-transformers is not installed. Falling back to lexical reinsertion coverage.",
+                RuntimeWarning,
+            )
+            return
+        device = self._best_compute_device()
+        try:
+            self.semantic_model = SentenceTransformer(self.config.semantic_model_name, device=device)
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load semantic model '{self.config.semantic_model_name}'. "
+                f"Using lexical fallback instead. Error: {exc}",
+                RuntimeWarning,
+            )
+            self.semantic_model = None
 
     def token_len(self, text: str) -> int:
         if not text.strip():
@@ -213,6 +281,27 @@ class HierarchicalSummarizer:
     def _word_tokens(self, text: str) -> List[str]:
         return re.findall(r"[A-Za-z0-9À-ÿ][A-Za-z0-9À-ÿ\-_/]*", text.lower())
 
+    def _extract_numbers(self, text: str) -> Set[str]:
+        numbers = re.findall(
+            r"\b\d{1,3}(?:[.\s]\d{3})*(?:,\d+)?\b|\b\d+(?:[.,]\d+)?%?\b|R\$\s?\d+(?:[.,]\d+)?",
+            text,
+            flags=re.IGNORECASE,
+        )
+        normalized: Set[str] = set()
+        for num in numbers:
+            normalized_num = re.sub(r"\s+", "", num.lower())
+            normalized.add(normalized_num)
+        return normalized
+
+    def _extract_entities(self, text: str, max_items: int = 60) -> Set[str]:
+        entity_pattern = r"\b[A-ZÀ-Ý]{2,}\b|\b[A-ZÀ-Ý][a-zà-ÿ]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ]+)+"
+        entities = re.findall(entity_pattern, text)
+        cleaned = [re.sub(r"\s+", " ", ent.strip()) for ent in entities if ent and len(ent) > 2]
+        if not cleaned:
+            return set()
+        counts = Counter(cleaned)
+        return {entity for entity, _ in counts.most_common(max_items)}
+
     def _critical_sentences(self, text: str, top_k: int) -> List[str]:
         sentences = self._split_sentences(text)
         if not sentences:
@@ -247,18 +336,22 @@ class HierarchicalSummarizer:
             scored.append((score, sentence))
 
         scored.sort(key=lambda item: item[0], reverse=True)
-        selected = [sentence for _, sentence in scored[:top_k]]
-        return selected
+        return [sentence for _, sentence in scored[:top_k]]
 
     def _keywords(self, text: str, max_terms: int = 6) -> List[str]:
         words = [w for w in self._word_tokens(text) if w not in PT_STOPWORDS and len(w) > 3]
         freq = Counter(words)
         return [word for word, _ in freq.most_common(max_terms)]
 
-    def _missing_critical_sentences(self, summary: str, critical_sentences: List[str]) -> List[str]:
+    def _missing_critical_sentences_lexical(self, summary: str, critical_sentences: List[str]) -> List[str]:
         summary_lower = summary.lower()
         missing: List[str] = []
+        summary_numbers = self._extract_numbers(summary)
         for sentence in critical_sentences:
+            sentence_numbers = self._extract_numbers(sentence)
+            if sentence_numbers and not sentence_numbers.issubset(summary_numbers):
+                missing.append(sentence)
+                continue
             keys = self._keywords(sentence, max_terms=4)
             if not keys:
                 continue
@@ -266,6 +359,57 @@ class HierarchicalSummarizer:
             if hits == 0:
                 missing.append(sentence)
         return missing
+
+    def _encode_semantic(self, texts: List[str]) -> torch.Tensor:
+        if self.semantic_model is None:
+            return torch.empty((0, 0), dtype=torch.float32)
+        return self.semantic_model.encode(
+            texts,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.config.semantic_batch_size,
+        )
+
+    def _missing_critical_sentences_semantic(self, summary: str, critical_sentences: List[str]) -> List[str]:
+        if self.semantic_model is None:
+            return self._missing_critical_sentences_lexical(summary, critical_sentences)
+        summary_sentences = self._split_sentences(summary)
+        if not summary_sentences:
+            return critical_sentences
+
+        summary_lower = summary.lower()
+        summary_numbers = self._extract_numbers(summary)
+        summary_entities_lower = {entity.lower() for entity in self._extract_entities(summary, max_items=120)}
+
+        summary_embeddings = self._encode_semantic(summary_sentences)
+        critical_embeddings = self._encode_semantic(critical_sentences)
+        if summary_embeddings.numel() == 0 or critical_embeddings.numel() == 0:
+            return self._missing_critical_sentences_lexical(summary, critical_sentences)
+
+        sims = torch.matmul(critical_embeddings, summary_embeddings.T)
+        max_sims = sims.max(dim=1).values.tolist()
+
+        missing: List[str] = []
+        for idx, sentence in enumerate(critical_sentences):
+            sentence_numbers = self._extract_numbers(sentence)
+            if sentence_numbers and not sentence_numbers.issubset(summary_numbers):
+                missing.append(sentence)
+                continue
+
+            sentence_entities = {entity.lower() for entity in self._extract_entities(sentence, max_items=16)}
+            entity_hits = sum(1 for entity in sentence_entities if entity in summary_entities_lower)
+            lexical_hits = sum(1 for key in self._keywords(sentence, max_terms=4) if key in summary_lower)
+            semantic_hit = max_sims[idx] >= self.config.semantic_similarity_threshold
+
+            if not semantic_hit and lexical_hits == 0 and entity_hits == 0:
+                missing.append(sentence)
+        return missing
+
+    def _missing_critical_sentences(self, summary: str, critical_sentences: List[str]) -> List[str]:
+        if not self.config.semantic_reinsertion_enabled:
+            return self._missing_critical_sentences_lexical(summary, critical_sentences)
+        return self._missing_critical_sentences_semantic(summary, critical_sentences)
 
     def _format_prompt(self, system_text: str, user_text: str) -> str:
         if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
@@ -278,8 +422,7 @@ class HierarchicalSummarizer:
 
     def _generate(self, prompt: str, max_new_tokens: int) -> str:
         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True)
-        input_device = getattr(self.model, "device", torch.device("cpu"))
-        inputs = {name: tensor.to(input_device) for name, tensor in inputs.items()}
+        inputs = {name: tensor.to(self.generation_device) for name, tensor in inputs.items()}
 
         do_sample = self.config.temperature > 0
         generation_kwargs = {
@@ -300,9 +443,7 @@ class HierarchicalSummarizer:
         else:
             input_len = inputs["input_ids"].shape[1]
             generated_ids = output_ids[0][input_len:]
-
-        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        return text
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
     def _summarize_once(self, source_text: str, target_tokens: int) -> str:
         system_prompt = (
@@ -316,7 +457,11 @@ class HierarchicalSummarizer:
             f"TEXTO:\n<<<\n{source_text}\n>>>\n\nRESUMO FIEL:"
         )
         prompt = self._format_prompt(system_prompt, user_prompt)
-        return self._generate(prompt, max_new_tokens=min(self.config.max_generation_tokens, int(target_tokens * 1.7) + 40))
+        generated = self._generate(
+            prompt,
+            max_new_tokens=min(self.config.max_generation_tokens, int(target_tokens * 1.7) + 40),
+        )
+        return generated if generated else source_text
 
     def _reinsert_critical(self, source_text: str, summary: str, target_tokens: int) -> str:
         critical = self._critical_sentences(source_text, self.config.critical_sentences_per_chunk)
@@ -337,7 +482,10 @@ class HierarchicalSummarizer:
             "Reescreva um unico resumo integrado, sem lista separada, mantendo estilo objetivo:"
         )
         prompt = self._format_prompt(system_prompt, user_prompt)
-        revised = self._generate(prompt, max_new_tokens=min(self.config.max_generation_tokens, int(target_tokens * 1.4) + 32))
+        revised = self._generate(
+            prompt,
+            max_new_tokens=min(self.config.max_generation_tokens, int(target_tokens * 1.4) + 32),
+        )
         return revised or summary
 
     def _enforce_final_ratio(self, source_text: str, summary: str) -> str:
@@ -368,7 +516,10 @@ class HierarchicalSummarizer:
                 )
 
             prompt = self._format_prompt(system_prompt, user_prompt)
-            updated = self._generate(prompt, max_new_tokens=min(self.config.max_generation_tokens, int(target * 1.4) + 32))
+            updated = self._generate(
+                prompt,
+                max_new_tokens=min(self.config.max_generation_tokens, int(target * 1.4) + 32),
+            )
             if not updated:
                 break
             current = updated
@@ -386,19 +537,62 @@ class HierarchicalSummarizer:
                 current = " ".join(compact)
         elif current_tokens < lower:
             missing = self._missing_critical_sentences(current, self._critical_sentences(source_text, 12))
-            if missing:
-                additions: List[str] = []
-                for sentence in missing:
-                    tentative = f"{current} {sentence}".strip()
-                    if self.token_len(tentative) > upper:
-                        break
-                    additions.append(sentence)
-                    current = tentative
-                    if self.token_len(current) >= lower:
-                        break
-                if additions:
-                    current = current.strip()
+            for sentence in missing:
+                tentative = f"{current} {sentence}".strip()
+                if self.token_len(tentative) > upper:
+                    break
+                current = tentative
+                if self.token_len(current) >= lower:
+                    break
         return current
+
+    def evaluate_factual_fidelity(self, source_text: str, summary_text: str) -> Dict[str, object]:
+        source_numbers = self._extract_numbers(source_text)
+        summary_numbers = self._extract_numbers(summary_text)
+        numbers_present = len([num for num in source_numbers if num in summary_numbers])
+        numeric_coverage = _safe_div(numbers_present, len(source_numbers), default=1.0)
+
+        source_entities = self._extract_entities(source_text, max_items=80)
+        summary_lower = summary_text.lower()
+        entities_present = len([ent for ent in source_entities if ent.lower() in summary_lower])
+        entity_coverage = _safe_div(entities_present, len(source_entities), default=1.0)
+
+        critical = self._critical_sentences(source_text, self.config.factual_eval_top_sentences)
+        if critical:
+            missing = self._missing_critical_sentences(summary_text, critical)
+            critical_semantic_coverage = 1.0 - _safe_div(len(missing), len(critical))
+        else:
+            critical_semantic_coverage = 1.0
+
+        mean_similarity = 0.0
+        if self.semantic_model is not None and critical:
+            summary_sentences = self._split_sentences(summary_text)
+            if summary_sentences:
+                critical_embeddings = self._encode_semantic(critical)
+                summary_embeddings = self._encode_semantic(summary_sentences)
+                if critical_embeddings.numel() > 0 and summary_embeddings.numel() > 0:
+                    sims = torch.matmul(critical_embeddings, summary_embeddings.T)
+                    mean_similarity = float(sims.max(dim=1).values.mean().item())
+
+        overall_score = (
+            0.42 * numeric_coverage
+            + 0.23 * entity_coverage
+            + 0.35 * critical_semantic_coverage
+        )
+        overall_score = float(max(0.0, min(1.0, overall_score)))
+
+        return {
+            "overall_faithfulness_score": round(overall_score, 4),
+            "numeric_coverage": round(numeric_coverage, 4),
+            "entity_coverage": round(entity_coverage, 4),
+            "critical_semantic_coverage": round(critical_semantic_coverage, 4),
+            "mean_critical_similarity": round(mean_similarity, 4),
+            "source_facts": {
+                "numbers": len(source_numbers),
+                "entities": len(source_entities),
+                "critical_sentences": len(critical),
+            },
+        }
 
     def summarize(self, text: str) -> Dict[str, object]:
         if not text or not text.strip():
@@ -441,16 +635,20 @@ class HierarchicalSummarizer:
                 group_text = "\n\n".join(next_summaries[index : index + self.config.merge_group_size])
                 grouped.append(group_text)
             current_blocks = grouped
-
             if len(current_blocks) == 1:
                 break
 
         candidate = current_blocks[0]
-        candidate = self._reinsert_critical(text, candidate, target_tokens=max(60, int(original_tokens * self.config.target_reduction_ratio)))
+        candidate = self._reinsert_critical(
+            text,
+            candidate,
+            target_tokens=max(60, int(original_tokens * self.config.target_reduction_ratio)),
+        )
         final_summary = self._enforce_final_ratio(text, candidate)
-
         summary_tokens = self.token_len(final_summary)
-        result = {
+        factual_metrics = self.evaluate_factual_fidelity(text, final_summary)
+
+        return {
             "summary": final_summary,
             "metrics": {
                 "original_tokens": original_tokens,
@@ -460,9 +658,11 @@ class HierarchicalSummarizer:
                 "reduction_tolerance": self.config.reduction_tolerance,
                 "levels_used": levels_used,
                 "initial_chunks": len(chunks),
+                "semantic_reinsertion_enabled": bool(self.semantic_model is not None and self.config.semantic_reinsertion_enabled),
+                "semantic_model_name": self.config.semantic_model_name if self.semantic_model is not None else "",
+                "factual_fidelity": factual_metrics,
             },
         }
-        return result
 
     @staticmethod
     def to_pretty_json(data: Dict[str, object]) -> str:

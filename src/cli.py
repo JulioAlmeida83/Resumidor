@@ -36,6 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument("--disable-semantic-reinsertion", action="store_true")
+    parser.add_argument(
+        "--semantic-model-name",
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    )
+    parser.add_argument("--semantic-similarity-threshold", type=float, default=0.56)
+    parser.add_argument("--semantic-batch-size", type=int, default=32)
+    parser.add_argument("--factual-eval-top-sentences", type=int, default=24)
     return parser
 
 
@@ -72,6 +80,11 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
+        semantic_reinsertion_enabled=not args.disable_semantic_reinsertion,
+        semantic_model_name=args.semantic_model_name,
+        semantic_similarity_threshold=args.semantic_similarity_threshold,
+        semantic_batch_size=args.semantic_batch_size,
+        factual_eval_top_sentences=args.factual_eval_top_sentences,
     )
     summarizer = HierarchicalSummarizer(config)
     result = summarizer.summarize(text)
